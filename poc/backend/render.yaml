@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: sahion-backend
+    runtime: python
+    rootDir: poc/backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: REPLICATE_API_TOKEN
+        sync: false
+      - key: CLIPDROP_API_KEY
+        sync: false
+      - key: NANOBANANA_API_KEY
+        sync: false
