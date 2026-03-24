@@ -1,6 +1,9 @@
 import os
 import re
 import time
+import base64
+import asyncio
+import tempfile
 import httpx
 from fastapi import FastAPI, HTTPException, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,6 +12,7 @@ from pydantic import BaseModel
 from openai import OpenAI
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
+from gradio_client import Client as GradioClient, handle_file
 
 load_dotenv()
 
@@ -33,6 +37,25 @@ REPLICATE_HEADERS = {
 NANOBANANA_API_KEY = os.getenv("NANOBANANA_API_KEY")
 NANOBANANA_HEADERS = {
     "Authorization": f"Bearer {NANOBANANA_API_KEY}",
+    "Content-Type": "application/json",
+}
+
+FAL_API_KEY = os.getenv("FAL_API_KEY")
+FAL_HEADERS = {
+    "Authorization": f"Key {FAL_API_KEY}",
+    "Content-Type": "application/json",
+}
+
+SEGMIND_API_KEY = os.getenv("SEGMIND_API_KEY")
+SEGMIND_HEADERS = {
+    "x-api-key": SEGMIND_API_KEY or "",
+    "Content-Type": "application/json",
+}
+
+# HuggingFace token — used to call fal.ai/Fashn via HF's inference router
+HF_TOKEN = os.getenv("HF_TOKEN")
+HF_FAL_HEADERS = {
+    "Authorization": f"Bearer {HF_TOKEN}",
     "Content-Type": "application/json",
 }
 
@@ -278,7 +301,8 @@ def enrich_prompt(user_description: str, sleeve_token: str | None,
                     "Chinese, Russian, Arabic, Spanish, French, or any other). "
                     "Understand what outfit they want using the vocabulary above, then write a detailed "
                     "English Stable Diffusion prompt with: fabric texture, color details, fit, "
-                    "studio lighting, fashion editorial photography style, 4k quality. "
+                    "ghost mannequin product photography, clothing only on invisible mannequin, "
+                    "pure white background, studio lighting, sharp detail, 4k quality. "
                     "DO NOT mention sleeves or sleeve length — that will be added separately. "
                     f"The prompt MUST begin with '{gender_prefix}'. "
                     "Keep under 100 words. Return ONLY the English prompt text, no explanation."
@@ -361,9 +385,23 @@ async def generate_outfit(req: GenerateRequest):
 
     prediction_id = resp.json()["id"]
 
-    # Step 3: Poll until done
+    # Step 4: Poll until done
     result = poll_replicate(prediction_id)
     image_url = result["output"][0] if isinstance(result["output"], list) else result["output"]
+
+    # Step 5: Re-host on catbox so Nanobanana try-on can reliably fetch it later
+    try:
+        img_bytes = httpx.get(image_url, timeout=20).content
+        catbox_url = httpx.post(
+            "https://catbox.moe/user/api.php",
+            data={"reqtype": "fileupload"},
+            files={"fileToUpload": ("outfit.jpg", img_bytes, "image/jpeg")},
+            timeout=30,
+        ).text.strip()
+        if catbox_url.startswith("https://"):
+            image_url = catbox_url
+    except Exception:
+        pass  # use original Replicate URL if catbox upload fails
 
     return {
         "image_url": image_url,
@@ -375,8 +413,245 @@ async def generate_outfit(req: GenerateRequest):
 
 
 # ─────────────────────────────────────────────
-# ENDPOINT 2: PHOTO + OUTFIT → VIRTUAL TRY-ON (Nanobanana)
+# ENDPOINT 2: PHOTO + OUTFIT → VIRTUAL TRY-ON
+# Priority 1: Segmind Try-On Diffusion (free credits, Hugging Face)
+# Priority 2: Fashn.ai (fal.ai) — purpose-built, high quality
+# Priority 3: Nanobanana (fallback)
 # ─────────────────────────────────────────────
+
+def image_url_to_base64(url: str) -> str:
+    """Download an image from a URL and return base64-encoded string."""
+    resp = httpx.get(url, timeout=20, follow_redirects=True,
+                     headers={"User-Agent": "Mozilla/5.0"})
+    resp.raise_for_status()
+    return base64.b64encode(resp.content).decode("utf-8")
+
+
+def image_bytes_to_base64(data: bytes) -> str:
+    return base64.b64encode(data).decode("utf-8")
+
+
+async def tryon_idmvton(person_bytes: bytes, outfit_bytes: bytes, garment_desc: str = "") -> str:
+    """
+    Virtual try-on via IDM-VTON HuggingFace Space (yisol/IDM-VTON).
+    Uses gradio_client + HF_TOKEN — completely FREE with any HF account.
+    Returns base64 data URI of the result image.
+    """
+    # Write bytes to temp files (gradio_client needs file paths)
+    pf = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+    pf.write(person_bytes); pf.close()
+    gf = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+    gf.write(outfit_bytes); gf.close()
+
+    try:
+        # Run blocking gradio call in thread pool so we don't block FastAPI
+        def _run():
+            client = GradioClient("yisol/IDM-VTON", token=HF_TOKEN)
+            return client.predict(
+                dict={"background": handle_file(pf.name), "layers": [], "composite": None},
+                garm_img=handle_file(gf.name),
+                garment_des=garment_desc or "garment",
+                is_checked=True,
+                is_checked_crop=False,
+                denoise_steps=30,
+                seed=42,
+                api_name="/tryon",
+            )
+
+        result = await asyncio.get_event_loop().run_in_executor(None, _run)
+        result_path = result[0]  # first return value is the result image path
+
+        with open(result_path, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode("utf-8")
+        return f"data:image/png;base64,{img_b64}"
+    finally:
+        os.unlink(pf.name)
+        os.unlink(gf.name)
+
+
+async def tryon_segmind(person_bytes: bytes, outfit_url: str, category: str = "tops") -> str:
+    """
+    Segmind Try-On Diffusion via https://api.segmind.com/v1/try-on-diffusion
+    Uses base64-encoded images — no need for public URLs.
+    category: 'Upper body' | 'Lower body' | 'Dress'
+    Returns base64-encoded result image (data URI).
+    """
+    # Map our category names to Segmind's
+    cat_map = {
+        "tops": "Upper body",
+        "bottoms": "Lower body",
+        "one-pieces": "Dress",
+        "auto": "Upper body",  # sensible default
+    }
+    segmind_category = cat_map.get(category, "Upper body")
+
+    # Encode person photo
+    person_b64 = image_bytes_to_base64(person_bytes)
+
+    # Download + encode outfit image
+    async with httpx.AsyncClient(timeout=20) as client:
+        outfit_resp = await client.get(outfit_url, follow_redirects=True,
+                                       headers={"User-Agent": "Mozilla/5.0"})
+    outfit_b64 = image_bytes_to_base64(outfit_resp.content)
+
+    payload = {
+        "model_image": person_b64,
+        "cloth_image": outfit_b64,
+        "category": segmind_category,
+        "num_inference_steps": 35,
+        "guidance_scale": 7.5,
+        "seed": -1,
+        "base64": True,
+    }
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(
+            "https://api.segmind.com/v1/try-on-diffusion",
+            headers=SEGMIND_HEADERS,
+            json=payload,
+        )
+
+    if resp.status_code == 401:
+        raise Exception("Segmind: invalid API key")
+    if resp.status_code == 429:
+        raise Exception("Segmind: rate limit exceeded")
+    if resp.status_code != 200:
+        raise Exception(f"Segmind failed ({resp.status_code}): {resp.text[:200]}")
+
+    # Response is base64 image — could be JSON or plain text
+    try:
+        data = resp.json()
+        img_b64 = data.get("image") or data.get("data") or data.get("result") or data.get("output")
+    except Exception:
+        img_b64 = resp.text.strip()
+
+    if not img_b64:
+        raise Exception(f"Segmind: empty response: {resp.text[:200]}")
+
+    # Return as data URI
+    return f"data:image/png;base64,{img_b64}"
+
+
+async def tryon_hf_fashn(person_url: str, outfit_url: str, category: str = "auto") -> str:
+    """
+    Virtual try-on using Fashn via HuggingFace's fal-ai inference provider.
+    Uses HF_TOKEN — works with free HuggingFace account.
+    Same Fashn model, billed through HuggingFace credits.
+    """
+    cat_map = {
+        "tops": "tops",
+        "bottoms": "bottoms",
+        "one-pieces": "one-pieces",
+        "auto": "auto",
+    }
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(
+            "https://router.huggingface.co/fal-ai/fashn/tryon/v1.5",
+            headers=HF_FAL_HEADERS,
+            json={
+                "model_image": person_url,
+                "garment_image": outfit_url,
+                "category": cat_map.get(category, "auto"),
+                "mode": "quality",
+                "garment_photo_type": "auto",
+                "moderation_level": "permissive",
+                "num_samples": 1,
+                "output_format": "jpeg",
+            },
+        )
+
+        if resp.status_code == 401:
+            raise Exception("HF token invalid or missing inference permissions")
+        if resp.status_code != 200:
+            raise Exception(f"HF Fashn failed ({resp.status_code}): {resp.text[:300]}")
+
+        data = resp.json()
+
+        # Synchronous response with images array
+        if data.get("images"):
+            return data["images"][0]["url"]
+
+        # Async polling via request_id
+        request_id = data.get("request_id")
+        if not request_id:
+            raise Exception(f"No request_id from HF Fashn: {data}")
+
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            status_resp = await client.get(
+                f"https://router.huggingface.co/fal-ai/fashn/tryon/v1.5/requests/{request_id}/status",
+                headers=HF_FAL_HEADERS,
+            )
+            status = status_resp.json()
+            if status.get("status") == "COMPLETED":
+                result_resp = await client.get(
+                    f"https://router.huggingface.co/fal-ai/fashn/tryon/v1.5/requests/{request_id}",
+                    headers=HF_FAL_HEADERS,
+                )
+                return result_resp.json()["images"][0]["url"]
+            if status.get("status") in ("FAILED", "CANCELLED"):
+                raise Exception(f"HF Fashn job failed: {status}")
+            await asyncio.sleep(3)
+
+    raise Exception("HF Fashn try-on timed out")
+
+
+async def tryon_fashn(person_url: str, outfit_url: str, category: str = "auto") -> str:
+    """
+    Use Fashn.ai via fal.ai for high-quality virtual try-on.
+    category: 'tops' | 'bottoms' | 'one-pieces' | 'auto'
+    Returns result image URL.
+    """
+    async with httpx.AsyncClient(timeout=30) as client:
+        # Submit job
+        resp = await client.post(
+            "https://fal.run/fal-ai/fashn/tryon/v1.5",
+            headers=FAL_HEADERS,
+            json={
+                "model_image": person_url,
+                "garment_image": outfit_url,
+                "category": category,
+                "mode": "quality",
+                "garment_photo_type": "auto",
+                "moderation_level": "permissive",
+                "num_samples": 1,
+                "output_format": "jpeg",
+            },
+        )
+
+        if resp.status_code != 200:
+            raise Exception(f"Fashn submit failed: {resp.text[:200]}")
+
+        data = resp.json()
+
+        # Synchronous response — output is returned directly
+        if data.get("images"):
+            return data["images"][0]["url"]
+
+        # Async response — poll via request_id
+        request_id = data.get("request_id")
+        if not request_id:
+            raise Exception(f"No request_id from Fashn: {data}")
+
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            status_resp = await client.get(
+                f"https://fal.run/fal-ai/fashn/tryon/v1.5/requests/{request_id}/status",
+                headers=FAL_HEADERS,
+            )
+            status = status_resp.json()
+            if status.get("status") == "COMPLETED":
+                result_resp = await client.get(
+                    f"https://fal.run/fal-ai/fashn/tryon/v1.5/requests/{request_id}",
+                    headers=FAL_HEADERS,
+                )
+                return result_resp.json()["images"][0]["url"]
+            if status.get("status") in ("FAILED", "CANCELLED"):
+                raise Exception(f"Fashn job failed: {status}")
+            await asyncio.sleep(3)
+
+        raise Exception("Fashn try-on timed out")
+
 
 def poll_nanobanana(task_id: str, timeout: int = 180) -> str:
     """Poll Nanobanana until job completes, return result image URL."""
@@ -397,72 +672,149 @@ def poll_nanobanana(task_id: str, timeout: int = 180) -> str:
     raise HTTPException(status_code=504, detail="Nanobanana job timed out")
 
 
+async def remove_background(image_bytes: bytes) -> bytes:
+    """Remove background using Clipdrop so only the garment remains (no model confusion)."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            resp = await client.post(
+                "https://clipdrop-api.co/remove-background/v1",
+                headers={"x-api-key": CLIPDROP_API_KEY},
+                files={"image_file": ("outfit.jpg", image_bytes, "image/jpeg")},
+            )
+            if resp.status_code == 200:
+                return resp.content
+        except Exception:
+            pass
+    return image_bytes  # fallback: return original
+
+
+async def upload_to_public_host(image_bytes: bytes, filename: str, content_type: str) -> str:
+    """Upload image bytes to catbox.moe and return the public URL."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            r = await client.post(
+                "https://catbox.moe/user/api.php",
+                data={"reqtype": "fileupload"},
+                files={"fileToUpload": (filename, image_bytes, content_type)},
+            )
+            if r.status_code == 200 and r.text.strip().startswith("https://"):
+                return r.text.strip()
+        except Exception:
+            pass
+    raise HTTPException(status_code=500, detail="Could not upload image to a public host. Please try again.")
+
+
 @app.post("/api/tryon")
 async def virtual_tryon(
-    person_photo: UploadFile = File(..., description="Full body photo of the person"),
-    outfit_url: str = Query(..., description="Public URL of the outfit image"),
+    person_photo: UploadFile = File(...),
+    outfit_url: str = Query(...),
+    outfit_description: str = Query(default=""),
 ):
-    """
-    Takes a person photo + outfit image URL.
-    Uploads person photo to a temp host, then sends both URLs to Nanobanana for try-on.
-    """
     person_bytes = await person_photo.read()
 
-    # Step 1: Upload person photo to catbox.moe (free anonymous hosting) to get a public URL.
-    # Nanobanana requires real public URLs — it cannot accept base64 data URIs.
-    upload_resp = httpx.post(
-        "https://catbox.moe/user/api.php",
-        data={"reqtype": "fileupload"},
-        files={"fileToUpload": (person_photo.filename or "photo.jpg", person_bytes, person_photo.content_type or "image/jpeg")},
-        timeout=30,
-    )
+    # Detect garment category from description
+    desc_lower = outfit_description.lower()
+    is_top    = any(w in desc_lower for w in ["shirt","tshirt","t-shirt","top","blouse","kurta","kurti","sherwani","jacket","coat","sweater","hoodie","polo","tank","vest","tunic","kameez"])
+    is_bottom = any(w in desc_lower for w in ["pant","trouser","jeans","skirt","shorts","dhoti","lungi","legging","churidar","pajama","salwar"])
+    is_dress  = any(w in desc_lower for w in ["dress","saree","sari","lehenga","gown","frock","jumpsuit","romper"])
 
-    if upload_resp.status_code != 200 or not upload_resp.text.startswith("https://"):
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to upload person photo for try-on: {upload_resp.text[:200]}"
+    if is_dress:
+        fashn_category = "one-pieces"
+    elif is_bottom and not is_top:
+        fashn_category = "bottoms"
+    elif is_top and not is_bottom:
+        fashn_category = "tops"
+    else:
+        fashn_category = "auto"
+
+    # Download outfit image bytes once (needed by IDM-VTON and Segmind)
+    outfit_bytes = None
+    async with httpx.AsyncClient(timeout=20) as client:
+        try:
+            dl = await client.get(outfit_url, follow_redirects=True,
+                                  headers={"User-Agent": "Mozilla/5.0"})
+            if dl.status_code == 200 and len(dl.content) > 1000:
+                outfit_bytes = dl.content
+        except Exception:
+            pass
+
+    # ── Priority 1: IDM-VTON via HuggingFace Space (FREE with HF token) ──
+    if HF_TOKEN and HF_TOKEN != "your_hf_token_here" and outfit_bytes:
+        try:
+            result_url = await tryon_idmvton(person_bytes, outfit_bytes, garment_desc=outfit_description)
+            return {"result_url": result_url, "engine": "idm-vton"}
+        except Exception:
+            pass  # fall through
+
+    # ── Priority 2: Segmind (no public URL needed) ──
+    if SEGMIND_API_KEY and SEGMIND_API_KEY != "your_segmind_key_here":
+        try:
+            result_url = await tryon_segmind(person_bytes, outfit_url, category=fashn_category)
+            return {"result_url": result_url, "engine": "segmind"}
+        except Exception:
+            pass  # fall through
+
+    # For HF-Fashn/Nanobanana we need public URLs — upload to catbox
+    person_image_url = await upload_to_public_host(
+        person_bytes,
+        person_photo.filename or "photo.jpg",
+        person_photo.content_type or "image/jpeg"
+    )
+    if outfit_bytes:
+        try:
+            outfit_url = await upload_to_public_host(outfit_bytes, "outfit.jpg", "image/jpeg")
+        except Exception:
+            pass
+
+    # ── Priority 3: HuggingFace → Fashn (paid HF credits) ──
+    if HF_TOKEN and HF_TOKEN != "your_hf_token_here":
+        try:
+            result_url = await tryon_hf_fashn(person_image_url, outfit_url, category=fashn_category)
+            return {"result_url": result_url, "engine": "hf-fashn"}
+        except Exception:
+            pass  # fall through
+
+    # ── Priority 4: Direct Fashn.ai key ──
+    if FAL_API_KEY and FAL_API_KEY != "your_fal_key_here":
+        try:
+            result_url = await tryon_fashn(person_image_url, outfit_url, category=fashn_category)
+            return {"result_url": result_url, "engine": "fashn"}
+        except Exception:
+            pass  # fall through to Nanobanana
+
+    # ── Priority 5: Nanobanana ──
+    async with httpx.AsyncClient(timeout=30) as client:
+        nb_resp = await client.post(
+            "https://api.nanobananaapi.ai/api/v1/nanobanana/generate",
+            headers=NANOBANANA_HEADERS,
+            json={
+                "prompt": (
+                    f"Virtual try-on. IMAGE 1 is the TARGET PERSON — keep their exact face, skin, hair, body, pose. "
+                    f"IMAGE 2 is the GARMENT — apply it onto the person from Image 1. "
+                    f"{'Garment: ' + outfit_description + '.' if outfit_description else ''} "
+                    f"Realistic fit, natural drape, correct lighting."
+                ),
+                "type": "IMAGETOIAMGE",
+                "numImages": 1,
+                "imageUrls": [person_image_url, outfit_url],
+                "callBackUrl": "https://webhook.site/noop",
+                "watermark": False,
+            },
         )
 
-    person_image_url = upload_resp.text.strip()
+    if nb_resp.status_code not in (200, 201):
+        raise HTTPException(status_code=500, detail=f"Try-on failed: {nb_resp.text}")
 
-    # Step 2: Submit try-on to Nanobanana
-    resp = httpx.post(
-        "https://api.nanobananaapi.ai/api/v1/nanobanana/generate",
-        headers=NANOBANANA_HEADERS,
-        json={
-            "prompt": (
-                "Virtual fashion try-on: place the garment from Reference Image 2 onto the person "
-                "in Reference Image 1. Preserve the person's face, body, and pose exactly. "
-                "Make the clothing fit realistically with natural fabric drape and lighting."
-            ),
-            "type": "IMAGETOIAMGE",  # Nanobanana API typo — this is their actual enum value
-            "numImages": 1,
-            "imageUrls": [person_image_url, outfit_url],
-            "callBackUrl": "https://webhook.site/noop",  # required field; we poll instead
-            "watermark": False,
-        },
-        timeout=30,
-    )
+    resp_data = nb_resp.json()
+    if resp_data.get("code") == 402:
+        raise HTTPException(status_code=402, detail="Try-on credits exhausted. Please top up Nanobanana or add a FAL_API_KEY.")
 
-    if resp.status_code not in (200, 201):
-        raise HTTPException(status_code=500, detail=f"Nanobanana submit failed: {resp.text}")
-
-    resp_data = resp.json()
-    # taskId may be at top level or nested under "data"
-    task_id = (
-        resp_data.get("taskId")
-        or (resp_data.get("data") or {}).get("taskId")
-    )
+    task_id = (resp_data.get("data") or {}).get("taskId") or resp_data.get("taskId")
     if not task_id:
-        raise HTTPException(status_code=500, detail=f"No taskId in response: {resp.text}")
+        raise HTTPException(status_code=500, detail=f"No taskId in response: {nb_resp.text}")
 
-    # Step 3: Poll until done
     result_url = poll_nanobanana(task_id, timeout=180)
-
-    return {
-        "result_url": result_url,
-        "task_id": task_id,
-    }
+    return {"result_url": result_url, "engine": "nanobanana", "task_id": task_id}
 
 
 # ─────────────────────────────────────────────
