@@ -9,6 +9,7 @@ const EXAMPLE_PROMPTS = [
 
 export default function GenerateStep({ onComplete, onSkip, bodyProfile }) {
   const [description, setDescription] = useState("");
+  const [lighting, setLighting] = useState("auto");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [result, setResult] = useState(null);
@@ -21,6 +22,11 @@ export default function GenerateStep({ onComplete, onSkip, bodyProfile }) {
 
     // Build description with body context (but gender/person_type sent separately as hard constraints)
     let enrichedDescription = description;
+    if (lighting === "day") {
+      enrichedDescription += " under bright, natural daytime sunlight";
+    } else if (lighting === "night") {
+      enrichedDescription += " under nighttime, dark ambient lighting with flash photography";
+    }
     if (bodyProfile) {
       enrichedDescription += `. ${bodyProfile.bmi_label} build, ${bodyProfile.skin_tone.label} skin tone`;
       if (bodyProfile.height_cm) enrichedDescription += `, ${bodyProfile.height_cm}cm`;
@@ -78,6 +84,15 @@ export default function GenerateStep({ onComplete, onSkip, bodyProfile }) {
             {p}
           </button>
         ))}
+      </div>
+
+      <div className="toggle-row" style={{ marginTop: '16px', marginBottom: '16px' }}>
+        <label className="field-label">Lighting Condition</label>
+        <div className="toggle-group">
+          <button className={`toggle-btn ${lighting === 'auto' ? 'active' : ''}`} onClick={() => setLighting('auto')}>Auto</button>
+          <button className={`toggle-btn ${lighting === 'day' ? 'active' : ''}`} onClick={() => setLighting('day')}>☀️ Day Time</button>
+          <button className={`toggle-btn ${lighting === 'night' ? 'active' : ''}`} onClick={() => setLighting('night')}>🌙 Night Time</button>
+        </div>
       </div>
 
       <div className="input-group">

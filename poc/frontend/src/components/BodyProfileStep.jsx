@@ -101,6 +101,11 @@ export default function BodyProfileStep({ onComplete }) {
   const [bmi, setBmi]               = useState(null);
   const [bmiCategory, setBmiCategory] = useState(null);
 
+  const [heightUnit, setHeightUnit] = useState("cm");
+  const [weightUnit, setWeightUnit] = useState("kg");
+  const [heightFt, setHeightFt]     = useState("");
+  const [heightIn, setHeightIn]     = useState("");
+
   const isKid = personType === "kid";
 
   // Height/weight placeholder hints change by type
@@ -117,14 +122,19 @@ export default function BodyProfileStep({ onComplete }) {
   useEffect(() => {
     setHeight("");
     setWeight("");
+    setHeightFt("");
+    setHeightIn("");
     setAge("");
     setBmi(null);
     setBmiCategory(null);
   }, [personType]);
 
   useEffect(() => {
-    const h = parseFloat(height) / 100;
-    const w = parseFloat(weight);
+    let h_cm = heightUnit === "cm" ? parseFloat(height) : ((parseFloat(heightFt) || 0) * 12 + (parseFloat(heightIn) || 0)) * 2.54;
+    let w_kg = weightUnit === "kg" ? parseFloat(weight) : (parseFloat(weight) || 0) * 0.453592;
+    
+    const h = h_cm / 100;
+    const w = w_kg;
     const a = parseFloat(age) || (isKid ? 10 : 30);
     if (h > 0 && w > 0) {
       const calc = w / (h * h);
@@ -134,17 +144,20 @@ export default function BodyProfileStep({ onComplete }) {
       setBmi(null);
       setBmiCategory(null);
     }
-  }, [height, weight, age, isKid]);
+  }, [height, heightFt, heightIn, weight, age, isKid, heightUnit, weightUnit]);
 
-  const canContinue = height && weight && parseFloat(height) > 0 && parseFloat(weight) > 0;
+  const canContinue = (heightUnit === "cm" ? parseFloat(height) > 0 : parseFloat(heightFt) > 0) && parseFloat(weight) > 0;
 
   function handleContinue() {
+    let h_cm = heightUnit === "cm" ? parseFloat(height) : ((parseFloat(heightFt) || 0) * 12 + (parseFloat(heightIn) || 0)) * 2.54;
+    let w_kg = weightUnit === "kg" ? parseFloat(weight) : (parseFloat(weight) || 0) * 0.453592;
+    
     onComplete({
       person_type:  personType,
       gender,
       age:          age ? parseInt(age) : null,
-      height_cm:    parseFloat(height),
-      weight_kg:    parseFloat(weight),
+      height_cm:    Math.round(h_cm),
+      weight_kg:    Math.round(w_kg),
       bmi:          bmi ? parseFloat(bmi) : null,
       bmi_category: bmiCategory?.key,
       bmi_label:    bmiCategory?.label,
@@ -226,35 +239,48 @@ export default function BodyProfileStep({ onComplete }) {
 
           {/* Height */}
           <div className="field-group">
-            <label className="field-label">Height</label>
-            <div className="input-with-unit">
-              <input
-                type="number"
-                className="number-input"
-                placeholder={heightHint}
-                min={heightMin}
-                max={heightMax}
-                value={height}
-                onChange={(e) => setHeight(e.target.value)}
-              />
-              <span className="unit">cm</span>
+            <div style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+              <label className="field-label">Height</label>
+              <div className="toggle-group" style={{gap: '4px'}}>
+                <button className={`toggle-btn ${heightUnit === "cm" ? "active" : ""}`} style={{padding:'2px 8px', fontSize:'0.7rem'}} onClick={() => {setHeightUnit("cm"); setHeight("");}}>cm</button>
+                <button className={`toggle-btn ${heightUnit === "ft" ? "active" : ""}`} style={{padding:'2px 8px', fontSize:'0.7rem'}} onClick={() => {setHeightUnit("ft"); setHeightFt(""); setHeightIn("");}}>ft/in</button>
+              </div>
             </div>
+            {heightUnit === "cm" ? (
+              <div className="input-with-unit">
+                <input type="number" className="number-input" placeholder={heightHint} min={heightMin} max={heightMax} value={height} onChange={(e) => setHeight(e.target.value)} />
+                <span className="unit">cm</span>
+              </div>
+            ) : (
+             <div className="input-with-unit">
+                <input type="number" className="number-input" style={{width:'70px'}} placeholder={isKid ? "3" : "5"} min="1" max="8" value={heightFt} onChange={(e) => setHeightFt(e.target.value)} />
+                <span className="unit" style={{marginRight:'8px'}}>ft</span>
+                <input type="number" className="number-input" style={{width:'70px'}} placeholder="8" min="0" max="11" value={heightIn} onChange={(e) => setHeightIn(e.target.value)} />
+                <span className="unit">in</span>
+              </div>
+            )}
           </div>
 
           {/* Weight */}
           <div className="field-group">
-            <label className="field-label">Weight</label>
+            <div style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+              <label className="field-label">Weight</label>
+              <div className="toggle-group" style={{gap: '4px'}}>
+                <button className={`toggle-btn ${weightUnit === "kg" ? "active" : ""}`} style={{padding:'2px 8px', fontSize:'0.7rem'}} onClick={() => {setWeightUnit("kg"); setWeight("");}}>kg</button>
+                <button className={`toggle-btn ${weightUnit === "lbs" ? "active" : ""}`} style={{padding:'2px 8px', fontSize:'0.7rem'}} onClick={() => {setWeightUnit("lbs"); setWeight("");}}>lbs</button>
+              </div>
+            </div>
             <div className="input-with-unit">
               <input
                 type="number"
                 className="number-input"
-                placeholder={weightHint}
-                min={weightMin}
-                max={weightMax}
+                placeholder={weightUnit === "kg" ? weightHint : (isKid ? "45" : "145")}
+                min={weightUnit === "kg" ? weightMin : Math.round(weightMin * 2.2)}
+                max={weightUnit === "kg" ? weightMax : Math.round(weightMax * 2.2)}
                 value={weight}
                 onChange={(e) => setWeight(e.target.value)}
               />
-              <span className="unit">kg</span>
+              <span className="unit">{weightUnit}</span>
             </div>
           </div>
 

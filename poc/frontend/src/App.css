@@ -592,9 +592,11 @@ body {
 }
 
 .tryon-image {
-  width: 200px;
-  height: 280px;
-  object-fit: cover;
+  max-width: 100%;
+  width: 450px;
+  height: auto;
+  max-height: 600px;
+  object-fit: contain;
   border-radius: var(--radius);
   border: 1px solid var(--border);
 }
@@ -606,8 +608,9 @@ body {
 }
 
 .upload-placeholder {
-  width: 200px;
-  height: 280px;
+  width: 450px;
+  height: 600px;
+  max-width: 100%;
   border: 2px dashed var(--border);
   border-radius: var(--radius);
   display: flex;

@@ -362,46 +362,73 @@ async def generate_outfit(req: GenerateRequest):
 
     negative_prompt = base_negative
 
-    # Step 3: Submit to Replicate SDXL
-    resp = httpx.post(
-        "https://api.replicate.com/v1/predictions",
-        headers=REPLICATE_HEADERS,
-        json={
-            "version": "stability-ai/sdxl:39ed52f2a78e934b3ba6e2a89f5b1c712de7dfea535525255b1aa35c5565e08b",
-            "input": {
-                "prompt": enriched,
-                "negative_prompt": negative_prompt,
-                "width": 768,
-                "height": 1024,
-                "num_inference_steps": 35,
-                "guidance_scale": 8.5,
-                "scheduler": "DPMSolverMultistep",
+    image_url = None
+    prediction_id = "gemini_generated"
+    gemini_key = os.getenv("GEMINI_API_KEY")
+
+    # Step 3: Try Google Gemini Imagen if API key is present
+    if gemini_key:
+        try:
+            from google import genai
+            client = genai.Client(api_key=gemini_key)
+            result = client.models.generate_content(
+                model="gemini-3.1-flash-image-preview",
+                contents=[enriched],
+            )
+            for part in result.candidates[0].content.parts:
+                if part.inline_data is not None:
+                    catbox_resp = httpx.post(
+                        "https://catbox.moe/user/api.php",
+                        data={"reqtype": "fileupload"},
+                        files={"fileToUpload": ("gemini_outfit.jpg", part.inline_data.data, "image/jpeg")},
+                        timeout=30,
+                    )
+                    if catbox_resp.text.strip().startswith("https://"):
+                        image_url = catbox_resp.text.strip()
+                        break
+        except Exception as e:
+            print("Gemini Generation failed:", e)
+
+    # Step 4: Fallback to Replicate SDXL if Gemini fails or is missing
+    if not image_url:
+        resp = httpx.post(
+            "https://api.replicate.com/v1/predictions",
+            headers=REPLICATE_HEADERS,
+            json={
+                "version": "stability-ai/sdxl:39ed52f2a78e934b3ba6e2a89f5b1c712de7dfea535525255b1aa35c5565e08b",
+                "input": {
+                    "prompt": enriched,
+                    "negative_prompt": negative_prompt,
+                    "width": 768,
+                    "height": 1024,
+                    "num_inference_steps": 35,
+                    "guidance_scale": 8.5,
+                    "scheduler": "DPMSolverMultistep",
+                },
             },
-        },
-    )
+        )
 
-    if resp.status_code not in (200, 201):
-        raise HTTPException(status_code=500, detail=f"Replicate submit failed: {resp.text}")
+        if resp.status_code not in (200, 201):
+            raise HTTPException(status_code=500, detail=f"Replicate submit failed: {resp.text}")
 
-    prediction_id = resp.json()["id"]
+        prediction_id = resp.json()["id"]
 
-    # Step 4: Poll until done
-    result = poll_replicate(prediction_id)
-    image_url = result["output"][0] if isinstance(result["output"], list) else result["output"]
+        result = poll_replicate(prediction_id)
+        image_url = result["output"][0] if isinstance(result["output"], list) else result["output"]
 
-    # Step 5: Re-host on catbox so Nanobanana try-on can reliably fetch it later
-    try:
-        img_bytes = httpx.get(image_url, timeout=20).content
-        catbox_url = httpx.post(
-            "https://catbox.moe/user/api.php",
-            data={"reqtype": "fileupload"},
-            files={"fileToUpload": ("outfit.jpg", img_bytes, "image/jpeg")},
-            timeout=30,
-        ).text.strip()
-        if catbox_url.startswith("https://"):
-            image_url = catbox_url
-    except Exception:
-        pass  # use original Replicate URL if catbox upload fails
+        # Re-host on catbox so Nanobanana try-on can reliably fetch it later
+        try:
+            img_bytes = httpx.get(image_url, timeout=20).content
+            catbox_url = httpx.post(
+                "https://catbox.moe/user/api.php",
+                data={"reqtype": "fileupload"},
+                files={"fileToUpload": ("outfit.jpg", img_bytes, "image/jpeg")},
+                timeout=30,
+            ).text.strip()
+            if catbox_url.startswith("https://"):
+                image_url = catbox_url
+        except Exception:
+            pass  # use original Replicate URL if catbox upload fails
 
     return {
         "image_url": image_url,
@@ -556,7 +583,9 @@ async def tryon_hf_fashn(person_url: str, outfit_url: str, category: str = "auto
                 "garment_photo_type": "auto",
                 "moderation_level": "permissive",
                 "num_samples": 1,
-                "output_format": "jpeg",
+                "output_format": "png",
+                "restore_background": True,
+                "restore_faces": True,
             },
         )
 
@@ -615,7 +644,9 @@ async def tryon_fashn(person_url: str, outfit_url: str, category: str = "auto") 
                 "garment_photo_type": "auto",
                 "moderation_level": "permissive",
                 "num_samples": 1,
-                "output_format": "jpeg",
+                "output_format": "png",
+                "restore_background": True,
+                "restore_faces": True,
             },
         )
 
@@ -709,80 +740,186 @@ async def virtual_tryon(
     person_photo: UploadFile = File(...),
     outfit_url: str = Query(...),
     outfit_description: str = Query(default=""),
+    category: str = Query(default="auto"),
 ):
     person_bytes = await person_photo.read()
 
-    # Detect garment category from description
-    desc_lower = outfit_description.lower()
-    is_top    = any(w in desc_lower for w in ["shirt","tshirt","t-shirt","top","blouse","kurta","kurti","sherwani","jacket","coat","sweater","hoodie","polo","tank","vest","tunic","kameez"])
-    is_bottom = any(w in desc_lower for w in ["pant","trouser","jeans","skirt","shorts","dhoti","lungi","legging","churidar","pajama","salwar"])
-    is_dress  = any(w in desc_lower for w in ["dress","saree","sari","lehenga","gown","frock","jumpsuit","romper"])
+    # Helper function to strictly guarantee the result image is the same dimension as the uploaded photo
+    async def format_result(url_or_b64: str, engine_name: str, task_id_val: str = None) -> dict:
+        import io, base64, httpx
+        from PIL import Image
+        try:
+            # Load original image size
+            orig_img = Image.open(io.BytesIO(person_bytes))
+            orig_size = orig_img.size
 
-    if is_dress:
-        fashn_category = "one-pieces"
-    elif is_bottom and not is_top:
-        fashn_category = "bottoms"
-    elif is_top and not is_bottom:
-        fashn_category = "tops"
+            # Load generated image bytes
+            if url_or_b64.startswith("data:"):
+                encoded = url_or_b64.split(",", 1)[-1]
+                res_bytes = base64.b64decode(encoded)
+            else:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    r = await client.get(url_or_b64)
+                    res_bytes = r.content
+
+            # Resize if dimensions differ
+            res_img = Image.open(io.BytesIO(res_bytes)).convert("RGB")
+            if res_img.size != orig_size:
+                res_img = res_img.resize(orig_size, Image.LANCZOS)
+                out_io = io.BytesIO()
+                res_img.save(out_io, format="PNG")
+                b_val = out_io.getvalue()
+                
+                try:
+                    new_url = await upload_to_public_host(b_val, "resized.png", "image/png")
+                    res_obj = {"result_url": new_url, "engine": engine_name}
+                except Exception:
+                    b64 = base64.b64encode(b_val).decode("utf-8")
+                    res_obj = {"result_url": f"data:image/png;base64,{b64}", "engine": engine_name}
+            else:
+                res_obj = {"result_url": url_or_b64, "engine": engine_name}
+            
+            if task_id_val: res_obj["task_id"] = task_id_val
+            return res_obj
+        except Exception as e:
+            res_obj = {"result_url": url_or_b64, "engine": engine_name}
+            if task_id_val: res_obj["task_id"] = task_id_val
+            return res_obj
+
+    if category != "auto":
+        fashn_category = category
     else:
-        fashn_category = "auto"
+        # Detect garment category from description
+        desc_lower = outfit_description.lower()
+        is_top    = any(w in desc_lower for w in ["shirt","tshirt","t-shirt","top","blouse","kurta","kurti","sherwani","jacket","coat","sweater","hoodie","polo","tank","vest","tunic","kameez"])
+        is_bottom = any(w in desc_lower for w in ["pant","trouser","jeans","skirt","shorts","dhoti","lungi","legging","churidar","pajama","salwar"])
+        is_dress  = any(w in desc_lower for w in ["dress","saree","sari","lehenga","gown","frock","jumpsuit","romper", "suit", "suite", "set", "co-ord", "uniform", "overall"])
 
-    # Download outfit image bytes once (needed by IDM-VTON and Segmind)
+        if is_dress: fashn_category = "one-pieces"
+        elif is_bottom and not is_top: fashn_category = "bottoms"
+        elif is_top and not is_bottom: fashn_category = "tops"
+        else: fashn_category = "auto"
+
+    # Download outfit image bytes once
     outfit_bytes = None
     async with httpx.AsyncClient(timeout=20) as client:
         try:
-            dl = await client.get(outfit_url, follow_redirects=True,
-                                  headers={"User-Agent": "Mozilla/5.0"})
+            dl = await client.get(outfit_url, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"})
             if dl.status_code == 200 and len(dl.content) > 1000:
                 outfit_bytes = dl.content
         except Exception:
             pass
 
-    # ── Priority 1: IDM-VTON via HuggingFace Space (FREE with HF token) ──
-    if HF_TOKEN and HF_TOKEN != "your_hf_token_here" and outfit_bytes:
-        try:
-            result_url = await tryon_idmvton(person_bytes, outfit_bytes, garment_desc=outfit_description)
-            return {"result_url": result_url, "engine": "idm-vton"}
-        except Exception:
-            pass  # fall through
+    # Since getting original resolution back requires Fashn (which needs URLs), 
+    # we upload to catbox first so we can try Fashn before the lower-res options.
+    person_image_url = None
+    try:
+        person_image_url = await upload_to_public_host(
+            person_bytes, person_photo.filename or "photo.jpg", person_photo.content_type or "image/jpeg"
+        )
+    except Exception:
+        pass
 
-    # ── Priority 2: Segmind (no public URL needed) ──
-    if SEGMIND_API_KEY and SEGMIND_API_KEY != "your_segmind_key_here":
-        try:
-            result_url = await tryon_segmind(person_bytes, outfit_url, category=fashn_category)
-            return {"result_url": result_url, "engine": "segmind"}
-        except Exception:
-            pass  # fall through
-
-    # For HF-Fashn/Nanobanana we need public URLs — upload to catbox
-    person_image_url = await upload_to_public_host(
-        person_bytes,
-        person_photo.filename or "photo.jpg",
-        person_photo.content_type or "image/jpeg"
-    )
     if outfit_bytes:
         try:
             outfit_url = await upload_to_public_host(outfit_bytes, "outfit.jpg", "image/jpeg")
         except Exception:
             pass
 
-    # ── Priority 3: HuggingFace → Fashn (paid HF credits) ──
-    if HF_TOKEN and HF_TOKEN != "your_hf_token_here":
+    # ── Priority 1: Direct Fashn.ai key (absolute highest quality) ──
+    if FAL_API_KEY and FAL_API_KEY != "your_fal_key_here" and person_image_url:
         try:
-            result_url = await tryon_hf_fashn(person_image_url, outfit_url, category=fashn_category)
-            return {"result_url": result_url, "engine": "hf-fashn"}
+            result_url = await tryon_fashn(person_image_url, outfit_url, category=fashn_category)
+            return await format_result(result_url, "fashn")
         except Exception:
             pass  # fall through
 
-    # ── Priority 4: Direct Fashn.ai key ──
-    if FAL_API_KEY and FAL_API_KEY != "your_fal_key_here":
+    # ── Priority 2: HuggingFace → Fashn (paid HF credits, high quality) ──
+    if HF_TOKEN and HF_TOKEN != "your_hf_token_here" and person_image_url:
         try:
-            result_url = await tryon_fashn(person_image_url, outfit_url, category=fashn_category)
-            return {"result_url": result_url, "engine": "fashn"}
+            result_url = await tryon_hf_fashn(person_image_url, outfit_url, category=fashn_category)
+            return await format_result(result_url, "hf-fashn")
         except Exception:
-            pass  # fall through to Nanobanana
+            pass  # fall through
+
+    # ── Priority 2.5: Gemini 3.1 Flash Native (Requires GEMINI_API_KEY) ──
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    if gemini_key and outfit_bytes:
+        try:
+            from google import genai
+            from google.genai import types
+            from PIL import Image
+            import io
+
+            g_client = genai.Client(api_key=gemini_key)
+            p_img = Image.open(io.BytesIO(person_bytes))
+            g_img = Image.open(io.BytesIO(outfit_bytes))
+
+            cat_instruction = "Replace the garment appropriately."
+            if fashn_category == "one-pieces":
+                cat_instruction = "WARNING: This is a FULL OUTFIT (dress/suit/onesie). You MUST replace BOTH the top shirt AND the bottom pants/skirt of the person! Cover the full body."
+            elif fashn_category == "bottoms":
+                cat_instruction = "WARNING: This is BOTTOM WEAR (pants/skirt/shorts). You MUST leave the person's upper shirt completely unchanged, and ONLY replace their pants/skirt."
+            elif fashn_category == "tops":
+                cat_instruction = "WARNING: This is UPPER WEAR (shirt/jacket). You MUST leave the person's pants/skirt completely unchanged, and ONLY replace their shirt/top."
+
+            gemini_prompt = (
+                f"Virtual try-on editing task. Image 1 is the TARGET PERSON. Image 2 is the GARMENT. "
+                f"Apply the garment from Image 2 onto the person in Image 1 incredibly realistically. "
+                f"Keep their exact face, skin, hair, and pose. {cat_instruction} "
+                f"Ensure realistic fit, natural drape, and correct lighting."
+            )
+
+            result = g_client.models.generate_content(
+                model="gemini-3.1-flash-image-preview",
+                contents=[gemini_prompt, p_img, g_img],
+                config=types.GenerateContentConfig(response_modalities=['IMAGE'])
+            )
+
+            for part in result.candidates[0].content.parts:
+                if part.inline_data is not None:
+                    catbox_resp = httpx.post(
+                        "https://catbox.moe/user/api.php",
+                        data={"reqtype": "fileupload"},
+                        files={"fileToUpload": ("gemini_tryon.png", part.inline_data.data, "image/png")},
+                        timeout=30,
+                    )
+                    if catbox_resp.text.strip().startswith("https://"):
+                        return await format_result(catbox_resp.text.strip(), "gemini")
+                    else:
+                        import base64
+                        b64 = base64.b64encode(part.inline_data.data).decode("utf-8")
+                        return await format_result(f"data:image/png;base64,{b64}", "gemini")
+        except Exception as e:
+            print("Gemini Native Try-On failed:", e)
+            pass  # fall through
+
+    # ── Priority 3: IDM-VTON via HuggingFace Space (FREE, max 768x1024) ──
+    # Note: IDM-VTON model only accurately processes Tops/Upper-body. We bypass it for dresses.
+    if HF_TOKEN and HF_TOKEN != "your_hf_token_here" and outfit_bytes and fashn_category in ["tops", "auto"]:
+        try:
+            result_url = await tryon_idmvton(person_bytes, outfit_bytes, garment_desc=outfit_description)
+            return await format_result(result_url, "idm-vton")
+        except Exception:
+            pass  # fall through
+
+    # ── Priority 4: Segmind (lower res, no public URL needed) ──
+    if SEGMIND_API_KEY and SEGMIND_API_KEY != "your_segmind_key_here":
+        try:
+            result_url = await tryon_segmind(person_bytes, outfit_url, category=fashn_category)
+            return await format_result(result_url, "segmind")
+        except Exception:
+            pass  # fall through
 
     # ── Priority 5: Nanobanana ──
+    category_instruction = ""
+    if fashn_category == "one-pieces":
+        category_instruction = "WARNING: This is a FULL OUTFIT (dress/suit/onesie). You MUST replace BOTH the top shirt AND the bottom pants/skirt of the person! Cover the full body."
+    elif fashn_category == "bottoms":
+        category_instruction = "WARNING: This is BOTTOM WEAR (pants/skirt/shorts). You MUST leave the person's upper shirt completely unchanged, and ONLY replace their pants/skirt."
+    elif fashn_category == "tops":
+        category_instruction = "WARNING: This is UPPER WEAR (shirt/jacket). You MUST leave the person's pants/skirt completely unchanged, and ONLY replace their shirt/top."
+
     async with httpx.AsyncClient(timeout=30) as client:
         nb_resp = await client.post(
             "https://api.nanobananaapi.ai/api/v1/nanobanana/generate",
@@ -790,7 +927,7 @@ async def virtual_tryon(
             json={
                 "prompt": (
                     f"Virtual try-on. IMAGE 1 is the TARGET PERSON — keep their exact face, skin, hair, body, pose. "
-                    f"IMAGE 2 is the GARMENT — apply it onto the person from Image 1. "
+                    f"IMAGE 2 is the GARMENT — apply it onto the person from Image 1. {category_instruction} "
                     f"{'Garment: ' + outfit_description + '.' if outfit_description else ''} "
                     f"Realistic fit, natural drape, correct lighting."
                 ),
@@ -814,7 +951,7 @@ async def virtual_tryon(
         raise HTTPException(status_code=500, detail=f"No taskId in response: {nb_resp.text}")
 
     result_url = poll_nanobanana(task_id, timeout=180)
-    return {"result_url": result_url, "engine": "nanobanana", "task_id": task_id}
+    return await format_result(result_url, "nanobanana", task_id_val=task_id)
 
 
 # ─────────────────────────────────────────────

@@ -6,6 +6,7 @@ export default function TryOnStep({ outfitImageUrl, outfitDescription, onComplet
   const [fetchedProduct, setFetchedProduct]   = useState(null);
   const [fetchingProduct, setFetchingProduct] = useState(false);
   const [fetchError, setFetchError]           = useState(null);
+  const [categoryOverride, setCategoryOverride] = useState("auto");
 
   const [photo, setPhoto]               = useState(null);
   const [photoPreview, setPhotoPreview] = useState(null);
@@ -124,6 +125,7 @@ export default function TryOnStep({ outfitImageUrl, outfitDescription, onComplet
       const params = new URLSearchParams({
         outfit_url: activeOutfitUrl,
         outfit_description: activeOutfitName || "",
+        category: categoryOverride,
       });
       const resp = await fetch(
         `${import.meta.env.VITE_API_URL}/api/tryon?${params}`,
@@ -162,6 +164,17 @@ export default function TryOnStep({ outfitImageUrl, outfitDescription, onComplet
           >
             Paste Product Link
           </button>
+        </div>
+      </div>
+
+      {/* ── TRY-ON MODE TOGGLE ── */}
+      <div className="toggle-row" style={{ marginBottom: 20 }}>
+        <label className="field-label">What to wear?</label>
+        <div className="toggle-group">
+          <button className={`toggle-btn ${categoryOverride === "auto" ? "active" : ""}`} onClick={() => setCategoryOverride("auto")}>🤖 Auto</button>
+          <button className={`toggle-btn ${categoryOverride === "tops" ? "active" : ""}`} onClick={() => setCategoryOverride("tops")}>👕 Top</button>
+          <button className={`toggle-btn ${categoryOverride === "bottoms" ? "active" : ""}`} onClick={() => setCategoryOverride("bottoms")}>👖 Bottom</button>
+          <button className={`toggle-btn ${categoryOverride === "one-pieces" ? "active" : ""}`} onClick={() => setCategoryOverride("one-pieces")}>👗 Full Dress</button>
         </div>
       </div>
 
